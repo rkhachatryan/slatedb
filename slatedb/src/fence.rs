@@ -14,6 +14,7 @@ use std::time::Duration;
 pub(crate) struct WriterFencer {
     table_store: Arc<TableStore>,
     manifest_update_timeout: Duration,
+    wal_enabled: bool,
     system_clock: Arc<dyn SystemClock>,
     #[cfg_attr(not(test), allow(dead_code))]
     fp_ctl: Arc<FailPointCtl>,
@@ -76,9 +77,34 @@ impl WriterFencer {
         Self {
             table_store,
             manifest_update_timeout: settings.manifest_update_timeout,
+            // Use the canonical accessor so this file stays free of `#[cfg]`. Returns true
+            // unless the `wal_disable` feature is on AND `settings.wal_enabled` is false.
+            wal_enabled: crate::db::DbInner::wal_enabled_in_options(settings),
             system_clock,
             fp_ctl,
         }
+    }
+
+    /// Mode-switch guard for the WAL-disabled boundary advance.
+    ///
+    /// SlateDB allows toggling WAL on/off across opens (see `test_disable_wal_after_wal_enabled`).
+    /// The first open after switching from WAL-enabled to WAL-disabled can still have un-replayed
+    /// DATA WALs sitting in the range `(replay_after_wal_id, empty_wal_id)`. If we jumped the
+    /// boundary straight to `empty_wal_id` in that case, GC would orphan those data WALs and we'd
+    /// lose data. So before advancing we probe the range and only allow the jump when every WAL in
+    /// it is a zero-byte (size == 0) fence. If any data (size > 0) WAL exists, the caller falls
+    /// back to the existing behavior (non-empty replay_range, no boundary bump) so replay still
+    /// happens. `empty_wal_id` itself is the fence we just wrote and is excluded from the probe.
+    async fn range_has_no_data_wals(
+        &self,
+        replay_after_wal_id: u64,
+        empty_wal_id: u64,
+    ) -> Result<bool, SlateDBError> {
+        let wals = self
+            .table_store
+            .list_wal_ssts(replay_after_wal_id + 1..empty_wal_id)
+            .await?;
+        Ok(wals.iter().all(|w| w.metadata.size == 0))
     }
 
     #[cfg(test)]
@@ -151,7 +177,7 @@ impl WriterFencer {
 
             // Refresh validates that we own the latest epoch still.
             manifest.refresh().await?;
-            let dirty_manifest = manifest.prepare_dirty()?;
+            let mut dirty_manifest = manifest.prepare_dirty()?;
             let replay_after_wal_id = dirty_manifest.value.core.replay_after_wal_id;
             self.fp_notify(format!("{}:{}", "RefreshManifest", attempt));
 
@@ -160,6 +186,38 @@ impl WriterFencer {
                 // so it should not be possible for it to have advanced past the fencing wal.
                 // older writers would have failed with a stale epoch
                 assert!(empty_wal_id > replay_after_wal_id);
+
+                // When WAL is disabled, the fence WAL we just wrote (empty_wal_id) is the only
+                // "WAL" in the range (replay_after_wal_id, empty_wal_id], and it carries no data.
+                // Advance the gc boundary (replay_after_wal_id) right up to it and persist that
+                // durably so downstream consumers (e.g. clone's validate_no_wal, which checks
+                // `next_wal_sst_id - 1 > replay_after_wal_id`) don't treat the fence as
+                // outstanding data, and so older fences become GC-eligible.
+                //
+                // We only advance TO empty_wal_id (never past it): GC deletes strictly below
+                // replay_after_wal_id, so the boundary fence object is retained, preserving the
+                // last_seen_wal_id S3-probe contiguity that next_wal_sst_id relies on.
+                if !self.wal_enabled
+                    && self
+                        .range_has_no_data_wals(replay_after_wal_id, empty_wal_id)
+                        .await?
+                {
+                    // The epoch-bump manifest write happened earlier in init_writer, before the
+                    // fence WAL existed and before empty_wal_id was finalized, so the boundary
+                    // advance cannot be folded into it — do a second durable CAS write here.
+                    dirty_manifest.value.core.replay_after_wal_id = empty_wal_id;
+                    dirty_manifest.value.core.next_wal_sst_id = empty_wal_id + 1;
+                    // update() CAS-writes the manifest and returns Fenced if another writer
+                    // moved the epoch out from under us; propagate that to the caller.
+                    manifest.update(dirty_manifest).await?;
+                    return Ok(WriterFenceResult {
+                        manifest,
+                        // Nothing to replay: the only WAL in range is the zero-byte fence and the
+                        // boundary now points at it.
+                        replay_range: empty_wal_id + 1..empty_wal_id + 1,
+                    });
+                }
+
                 return Ok(WriterFenceResult {
                     manifest,
                     replay_range: replay_after_wal_id + 1..empty_wal_id + 1,
@@ -216,8 +274,11 @@ mod tests {
 
     impl WriterFencerTestHarness {
         async fn new(path: &str) -> Self {
+            Self::new_with_settings(path, test_db_options()).await
+        }
+
+        async fn new_with_settings(path: &str, settings: Settings) -> Self {
             let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let settings = test_db_options();
             let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
             let manifest_store =
                 Arc::new(ManifestStore::new(&Path::from(path), object_store.clone()));
@@ -432,6 +493,112 @@ mod tests {
         h.assert_fencing_wal().await;
         h.assert_wals_contiguous().await;
         h.assert_data().await;
+    }
+
+    /// When WAL is enabled, fencing must NOT bump replay_after_wal_id up to the fence wal: the
+    /// replay_range stays non-empty (covering the fence) and the persisted boundary is unchanged.
+    #[tokio::test]
+    async fn test_fence_wal_enabled_does_not_bump_boundary() {
+        let mut h = WriterFencerTestHarness::new(
+            "/tmp/test_fence_wal_enabled_does_not_bump_boundary",
+        )
+        .await;
+        let db = h.db().await;
+        h.put(&db, 1, false).await;
+
+        let boundary_before = h
+            .manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest
+            .core
+            .replay_after_wal_id;
+
+        let fencer = h.fencer.take().unwrap();
+        let result = fencer
+            .fence(h.stored_manifest.take().unwrap())
+            .await
+            .unwrap();
+
+        // replay_range covers the data wal(s) and the fence wal -> non-empty.
+        assert!(
+            result.replay_range.start < result.replay_range.end,
+            "expected non-empty replay_range, got {:?}",
+            result.replay_range
+        );
+        let boundary_after = h
+            .manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest
+            .core
+            .replay_after_wal_id;
+        assert_eq!(
+            boundary_after, boundary_before,
+            "replay_after_wal_id must not advance at fence when wal is enabled"
+        );
+        h.assert_fencing_wal().await;
+    }
+
+    /// When WAL is disabled, fencing advances replay_after_wal_id up to the just-written fence wal
+    /// and persists it durably, so `next_wal_sst_id - 1 == replay_after_wal_id` (no outstanding
+    /// "WAL"). The fence object at the boundary must still exist.
+    #[cfg(feature = "wal_disable")]
+    #[tokio::test]
+    async fn test_fence_wal_disabled_bumps_boundary() {
+        let settings = Settings {
+            wal_enabled: false,
+            garbage_collector_options: None,
+            ..Settings::default()
+        };
+        let mut h = WriterFencerTestHarness::new_with_settings(
+            "/tmp/test_fence_wal_disabled_bumps_boundary",
+            settings,
+        )
+        .await;
+
+        let fencer = h.fencer.take().unwrap();
+        let result = fencer
+            .fence(h.stored_manifest.take().unwrap())
+            .await
+            .unwrap();
+
+        // The only wal in range is the zero-byte fence, and the boundary now points at it,
+        // so there is nothing to replay.
+        assert_eq!(
+            result.replay_range.start, result.replay_range.end,
+            "expected empty replay_range, got {:?}",
+            result.replay_range
+        );
+
+        let core = h
+            .manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest
+            .core;
+        assert_eq!(
+            core.replay_after_wal_id,
+            core.next_wal_sst_id - 1,
+            "expected replay_after_wal_id == next_wal_sst_id - 1, got {} vs {}",
+            core.replay_after_wal_id,
+            core.next_wal_sst_id - 1
+        );
+
+        // the fence object at the boundary must still exist (we advance only TO it, never past).
+        let fence = h
+            .table_store
+            .list_wal_ssts(core.replay_after_wal_id..=core.replay_after_wal_id)
+            .await
+            .unwrap();
+        assert_eq!(fence.len(), 1, "expected the boundary fence wal to exist");
+        assert_eq!(
+            fence[0].metadata.size, 0,
+            "boundary wal must be a zero-byte fence"
+        );
     }
 
     struct FencerFencedTestCase {
